@@ -4,17 +4,17 @@
 Databrary filtered-pretraining downloader.
 
 Commands:
-    python filtered_pretrain_download.py check
-    python filtered_pretrain_download.py list VOLUME [FOLDER ...]
-    python filtered_pretrain_download.py get VOLUME [FOLDER ...]
-    python filtered_pretrain_download.py extract SRC_DIR --out DIR
-    python filtered_pretrain_download.py merge-devcv SRC_DIR --out DIR
+    python track1_download.py check
+    python track1_download.py list VOLUME [FOLDER ...]
+    python track1_download.py get VOLUME [FOLDER ...]
+    python track1_download.py extract SRC_DIR --out DIR
+    python track1_download.py merge-devcv SRC_DIR --out DIR
 
 Features:
 - Authenticated Playwright/Chromium downloads
 - Folder and file selection
 - Original downloaded filenames
-- Download-link file-size validation
+- Strict verification for non-video files
 - Transcoded-video size/SHA-1 compatibility
 - Download SHA-1 sidecar records
 - Safe restart and skip verification
@@ -44,10 +44,13 @@ from playwright.sync_api import Error as PlaywrightError
 
 HERE = Path(__file__).resolve().parent
 
+REQUIRED = [
+    "DATABRARY_USERNAME",
+    "DATABRARY_PASSWORD",
+]
+
 RETRIES = 8
 STOP = threading.Event()
-
-PRETRAIN_FOLDER_IDS = ("78177", "78187", "78233")
 
 DEVCV_FOLDER_IDS = {
     "78234", "78235", "78236",
@@ -189,6 +192,7 @@ def load_sidecar(dest):
 def check_file(
     path,
     size,
+    expected_sha1=None,
     verify=True,
     file_id=None,
     volume=None,
@@ -197,12 +201,13 @@ def check_file(
     """
     Validate an existing download.
 
-    Non-video files are checked against the download-link size.
+    Non-video:
+        Strict metadata size and SHA-1 checks.
 
     Video:
         Prefer recorded actual size and SHA-1.
         Without a sidecar, only accept an exact
-        download-link-size match.
+        original-metadata match.
     """
     path = Path(path)
 
@@ -247,14 +252,22 @@ def check_file(
 
             return True
 
-        # No sidecar: do not silently trust a
-        # potentially transcoded existing video.
+        # No sidecar: accept if size matches the download-link size.
         if actual_size != size:
             return False
 
         return True
 
-    return actual_size == size
+    if actual_size != size:
+        return False
+
+    if verify and expected_sha1:
+        return (
+            sha1_of(path).lower()
+            == str(expected_sha1).lower()
+        )
+
+    return True
 
 
 def publish_new_file(temp, dest):
@@ -416,6 +429,8 @@ def download_file(
     name = info.get("fileName") or meta["name"]
     size = int(info.get("fileSize") or meta["size"])
     original_size = int(meta["size"])
+    expected_sha1 = meta.get("sha1")
+
     if not valid_filename(name):
         raise RuntimeError(
             f"Unsafe filename: {name!r}"
@@ -429,6 +444,7 @@ def download_file(
         if check_file(
             dest,
             size,
+            expected_sha1,
             verify,
             file_id=meta["id"],
             volume=volume,
@@ -511,6 +527,7 @@ def download_file(
                 )
 
             actual_sha1 = None
+            sha1_matched = False
 
             if is_video:
                 # Videos can be transcoded.
@@ -523,18 +540,34 @@ def download_file(
 
                 actual_sha1 = sha1_of(temp)
 
-                if actual_size != original_size:
+                sha1_matched = (
+                    bool(expected_sha1)
+                    and actual_sha1.lower()
+                    == str(expected_sha1).lower()
+                )
+
+                if (
+                    actual_size != original_size
+                    or not sha1_matched
+                ):
                     log(
                         "  Video differs from original "
-                        "metadata size (possibly transcoded): "
+                        "metadata (likely transcoded): "
                         f"original {human(original_size)}, "
                         f"downloaded {human(actual_size)}"
                     )
 
-                status = "SHA-1 recorded for restart validation"
+                status = (
+                    "verified"
+                    if (
+                        sha1_matched
+                        and actual_size == original_size
+                    )
+                    else "transcoded/unverified"
+                )
 
             else:
-                # The file list SHA-1 may describe a stale version.
+                # Strict validation for non-video files.
                 if actual_size != size:
                     raise RuntimeError(
                         f"Size mismatch for {name}: "
@@ -542,7 +575,28 @@ def download_file(
                         f"got {actual_size}"
                     )
 
-                status = "size checked against download link"
+                if verify and expected_sha1:
+                    log(
+                        f"  verifying SHA-1 of {name}..."
+                    )
+
+                    actual_sha1 = sha1_of(temp)
+
+                    sha1_matched = (
+                        actual_sha1.lower()
+                        == str(expected_sha1).lower()
+                    )
+
+                    if not sha1_matched:
+                        raise RuntimeError(
+                            f"SHA-1 mismatch for {name}"
+                        )
+
+                status = (
+                    "verified"
+                    if verify and expected_sha1
+                    else "not checked"
+                )
 
             # Publish atomically without overwriting.
             publish_new_file(temp, dest)
@@ -558,7 +612,9 @@ def download_file(
                     "original_size": original_size,
                     "download_link_size": size,
                     "actual_size": actual_size,
+                    "original_sha1": expected_sha1,
                     "actual_sha1": actual_sha1,
+                    "sha1_matches_original": sha1_matched,
                     "verification_status": status,
                     "downloaded_at": datetime.now().isoformat(),
                 }
@@ -578,7 +634,8 @@ def download_file(
 
             log(
                 f"Saved {dest} "
-                f"({human(actual_size)}, {status})"
+                f"({human(actual_size)}, "
+                f"SHA-1 {status})"
             )
 
             if is_video:
@@ -659,6 +716,7 @@ def find_mjpeg(folder, video_name):
         folder / relative,
         folder / relative.with_suffix(""),
     ]
+
     if relative.suffix.lower() in (".mjpeg", ".mjpg"):
         alternate = ".mjpg" if relative.suffix.lower() == ".mjpeg" else ".mjpeg"
         candidates.append(folder / relative.with_suffix(alternate))
@@ -1052,31 +1110,26 @@ def cmd_list(client, args):
     print(f"\nTotal: {human(grand)}")
 
 
-def cmd_get(client, args, allowed_folder_ids=PRETRAIN_FOLDER_IDS):
-    if args.volume != "1981":
-        raise RuntimeError("Downloads are restricted to volume 1981.")
+def cmd_get(client, args):
+    folders = client.folders(args.volume)
 
-    allowed = set(allowed_folder_ids)
-    selected = set(args.folders) if args.folders else allowed
-    disallowed = selected - allowed
-    if disallowed:
-        raise RuntimeError(
-            "Folder(s) not allowed for this downloader: "
-            + ", ".join(sorted(disallowed))
-        )
+    if args.folders:
+        folders = [
+            f for f in folders
+            if str(f["id"]) in args.folders
+        ]
 
-    folders = [
-        f for f in client.folders(args.volume)
-        if str(f["id"]) in selected
-    ]
+        found = {
+            str(f["id"]) for f in folders
+        }
 
-    found = {str(f["id"]) for f in folders}
-    missing = selected - found
-    if missing:
-        raise RuntimeError(
-            "Folder(s) not found: "
-            + ", ".join(sorted(missing))
-        )
+        missing = set(args.folders) - found
+
+        if missing:
+            raise RuntimeError(
+                "Folder(s) not found: "
+                + ", ".join(sorted(missing))
+            )
 
     if args.files and len(folders) != 1:
         raise RuntimeError(
@@ -1153,7 +1206,7 @@ def on_sigterm(signum, frame):
     raise KeyboardInterrupt
 
 
-def main(*, get_folder_ids=PRETRAIN_FOLDER_IDS):
+def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1186,7 +1239,6 @@ def main(*, get_folder_ids=PRETRAIN_FOLDER_IDS):
         "folders",
         nargs="*",
         metavar="FOLDER",
-        help="folder IDs (default: all allowed folders)",
     )
 
     s.add_argument(
@@ -1213,7 +1265,6 @@ def main(*, get_folder_ids=PRETRAIN_FOLDER_IDS):
     s.add_argument(
         "--no-verify",
         action="store_true",
-        help="skip local SHA-1 checks when validating existing videos",
     )
 
     s.add_argument(
@@ -1293,13 +1344,11 @@ def main(*, get_folder_ids=PRETRAIN_FOLDER_IDS):
     client = Client()
 
     try:
-        if args.cmd == "get":
-            cmd_get(client, args, get_folder_ids)
-        else:
-            {
-                "check": cmd_check,
-                "list": cmd_list,
-            }[args.cmd](client, args)
+        {
+            "check": cmd_check,
+            "list": cmd_list,
+            "get": cmd_get,
+        }[args.cmd](client, args)
 
     except KeyboardInterrupt:
         log("Interrupted.")

@@ -4,10 +4,10 @@
 Databrary browser-based bulk downloader.
 
 Commands:
-    python unfiltered_pretrain_download.py check
-    python unfiltered_pretrain_download.py list VOLUME --sessions
-    python unfiltered_pretrain_download.py get VOLUME --sessions --flat --out DIR
-    python unfiltered_pretrain_download.py get VOLUME SESSION_ID FILE_ID --sessions --flat --out DIR
+    python track2_download.py check
+    python track2_download.py list VOLUME --sessions
+    python track2_download.py get VOLUME --sessions --flat --out DIR
+    python track2_download.py get VOLUME SESSION_ID FILE_ID --sessions --flat --out DIR
 
 Downloads use authenticated Playwright/Chromium, not requests.
 
@@ -15,7 +15,7 @@ Features:
 - Volume / session / folder enumeration
 - Select a single session or individual file IDs
 - Original filenames
-- Download-link file-size validation
+- File size and optional SHA-1 verification
 - File-level retries and restart
 - No overwriting existing files
 - Preserves old .part and .progress.json files
@@ -43,6 +43,11 @@ from playwright.sync_api import Error as PlaywrightError
 
 
 HERE = Path(__file__).resolve().parent
+
+REQUIRED = [
+    "DATABRARY_USERNAME",
+    "DATABRARY_PASSWORD",
+]
 
 RETRIES = 8
 STOP = threading.Event()
@@ -121,8 +126,8 @@ def record_path(path):
     return path.with_name(path.name + ".download.json")
 
 
-def check_file(path, size, verify=True):
-    """Validate downloaded size and any locally recorded video digest."""
+def check_file(path, size, expected_sha1=None, verify=True):
+    """Never trust metadata SHA-1/size for a transcoded video."""
     if not path.is_file() or path.is_symlink():
         return False
 
@@ -140,7 +145,11 @@ def check_file(path, size, verify=True):
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             return False
 
-    return path.stat().st_size == size
+    if path.stat().st_size != size:
+        return False
+    if verify and expected_sha1:
+        return sha1_of(path).lower() == str(expected_sha1).lower()
+    return True
 
 
 def validate_video_container(path):
@@ -249,6 +258,7 @@ def download_file(
         )
 
     dest = out_dir / name
+    expected_sha1 = meta.get("sha1")
     if is_video(name) and (record_path(dest).exists() or record_path(dest).is_symlink()) and not (dest.exists() or dest.is_symlink()):
         raise RuntimeError(f"Existing sidecar without destination: {record_path(dest)}. Preserved.")
 
@@ -257,6 +267,7 @@ def download_file(
         if check_file(
             dest,
             size,
+            expected_sha1,
             verify,
         ):
             log(f"Skipping {dest} (already complete)")
@@ -326,8 +337,8 @@ def download_file(
                 f"({actual_size / max(t1 - t0, 1e-9) / 1e6:.2f} MB/s)"
             )
 
-            # The file-list SHA-1 can describe an older upload, so only
-            # compare downloads with the size from the signed link.
+            # Databrary can return a transcoded video with different
+            # size and SHA-1 than the original API metadata.
             actual_size = temp.stat().st_size
             if actual_size == 0:
                 raise RuntimeError(f"Empty download: {name}")
@@ -340,14 +351,18 @@ def download_file(
             if video:
                 validate_video_container(temp)
 
-            actual_sha1 = None
-            if video:
-                log(f"  calculating downloaded SHA-1 of {name}...")
-                actual_sha1 = sha1_of(temp)
+            log(f"  calculating downloaded SHA-1 of {name}...")
+            actual_sha1 = sha1_of(temp)
+            sha1_matched = bool(
+                expected_sha1 and actual_sha1.lower() == str(expected_sha1).lower()
+            )
 
-            if video and actual_size != size:
+            if not video and verify and expected_sha1 and not sha1_matched:
+                raise RuntimeError(f"SHA-1 mismatch for {name}")
+
+            if video and (actual_size != size or (expected_sha1 and not sha1_matched)):
                 log(
-                    f"  Video size differs from download-link metadata: "
+                    f"  Video differs from original metadata (likely transcoded): "
                     f"original {human(size)}, downloaded {human(actual_size)}"
                 )
 
@@ -364,19 +379,20 @@ def download_file(
                     "file_id": str(meta["id"]),
                     "filename": name,
                     "original_size": size,
+                    "original_sha1": expected_sha1,
                     "downloaded_size": actual_size,
                     "downloaded_sha1": actual_sha1,
+                    "original_sha1_matched": sha1_matched,
                     "verification": "download_sha1_recorded_mp4_header_checked"
                     if name.lower().endswith(".mp4") else "download_sha1_recorded",
                 }
                 write_record_exclusive(record_path(dest), record)
-                status = "downloaded SHA-1 recorded"
+                status = "original SHA-1 matched" if sha1_matched else "transcoded/unverified"
             else:
-                status = "size checked against download link"
+                status = "verified" if verify and expected_sha1 else "not checked"
 
-            log(f"Saved {dest} ({human(actual_size)}, {status})")
-            if video:
-                log(f"  Download SHA-1: {actual_sha1}")
+            log(f"Saved {dest} ({human(actual_size)}, SHA-1 {status})")
+            log(f"  Download SHA-1: {actual_sha1}")
 
             return dest
 
@@ -653,7 +669,7 @@ def main():
     s.add_argument(
         "--no-verify",
         action="store_true",
-        help="skip local SHA-1 checks when validating existing videos",
+        help="skip SHA-1 verification",
     )
 
     s.add_argument(
