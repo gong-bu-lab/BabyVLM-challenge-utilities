@@ -86,16 +86,11 @@ def fetch_split_json(dataset, splits_dir=None):
     except ImportError:
         sys.exit("ERROR: databrary_auth.py not found. Run from the databrary package directory.")
 
-    missing = [k for k in ("DATABRARY_USERNAME", "DATABRARY_PASSWORD") if not os.environ.get(k)]
-    if missing:
-        sys.exit(f"Missing credentials: {', '.join(missing)} (put them in {HERE / '.env'})")
-
     file_id = SPLIT_FILE_IDS[dataset]
     db = DatabarySession()
     try:
-        info = db.api_json(f"volumes/{SPLITS_VOLUME}/folders/{SPLITS_FOLDER}/files/{file_id}/")
-        download_url = info["downloadUrl"]
-        content = db.download_session().get(download_url, timeout=60).text
+        info = db.api_json(f"volumes/{SPLITS_VOLUME}/folders/{SPLITS_FOLDER}/files/{file_id}/download-link/")
+        content = db.fetch_text(info["downloadUrl"])
     finally:
         db.close()
 

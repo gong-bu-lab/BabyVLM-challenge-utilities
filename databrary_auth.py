@@ -238,6 +238,31 @@ class DatabarySession:
             )
         return result["data"]
 
+    def fetch_text(self, url):
+        """Fetch text content through the browser (for URLs that require session cookies)."""
+        if url.startswith("http://"):
+            url = url.replace("http://", "https://", 1)
+        with self._lock:
+            result = self._page.evaluate(
+                """async ({url, token}) => {
+                    try {
+                        const r = await fetch(url, {
+                            method: "GET",
+                            credentials: "include",
+                            headers: {Authorization: "Bearer " + token}
+                        });
+                        if (!r.ok) return {ok: false, status: r.status};
+                        return {ok: true, text: await r.text()};
+                    } catch(e) {
+                        return {ok: false, error: String(e)};
+                    }
+                }""",
+                {"url": url, "token": self._token},
+            )
+        if not result.get("ok"):
+            raise RuntimeError(f"fetch_text failed ({result.get('status')}) at {url}")
+        return result["text"]
+
     def api_pages(self, path):
         """Iterate all pages of a paginated API endpoint."""
         url = path
